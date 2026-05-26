@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.pid
+.bot_instance.lock
+.env
+mcp_stdout.log
+mcp_stderr.log
+bot_stdout.log
+bot_stderr.log
