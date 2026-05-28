@@ -403,14 +403,14 @@ class MT5MCPClient:
             symbols = []
             for item in result:
                 if isinstance(item, str):
-                    symbols.append(item.strip().upper())
+                    symbols.append(item.strip())
                 elif isinstance(item, dict):
                     value = item.get("symbol") or item.get("name") or item.get("Symbol") or item.get("Name")
                     if value:
-                        symbols.append(str(value).strip().upper())
+                        symbols.append(str(value).strip())
             return [s for s in symbols if s]
         if isinstance(result, str):
-            return [line.strip().upper() for line in result.replace(",", "\n").splitlines() if line.strip()]
+            return [line.strip() for line in result.replace(",", "\n").splitlines() if line.strip()]
         return []
 
     async def get_ohlcv(self, symbol: str, timeframe: str, count: int = 120) -> list[dict]:
@@ -877,6 +877,12 @@ def symbol_candidates(profile: str, aliases: list[str]) -> list[str]:
 
 
 def choose_detected_symbol(profile: str, aliases: list[str], available: list[str]) -> Optional[str]:
+    exact_candidates = [profile, *aliases]
+    available_exact = {symbol: symbol for symbol in available}
+    for candidate in exact_candidates:
+        if candidate in available_exact:
+            return available_exact[candidate]
+
     by_normalized = {normalize_symbol_text(symbol): symbol for symbol in available}
     candidates = symbol_candidates(profile, aliases)
     for candidate in candidates:
@@ -952,16 +958,18 @@ async def auto_detect_symbols() -> None:
 
 
 def current_trade_symbol() -> str:
-    profile = normalize_symbol_text(str(CHAT_SETTINGS.get("_global_symbol", SYMBOL)))
+    selected = str(CHAT_SETTINGS.get("_global_symbol", SYMBOL))
+    profile = normalize_symbol_text(selected)
     aliases = SYMBOL_PROFILES.get(profile) or SYMBOL_ALIASES
-    return aliases[0] if aliases else profile
+    return aliases[0] if aliases else selected
 
 
 def chat_symbol(chat_id: int) -> str:
     settings = CHAT_SETTINGS.setdefault(chat_id, {"timeframe": DEFAULT_TIMEFRAME, "symbol": SYMBOL})
-    profile = normalize_symbol_text(str(settings.get("symbol", SYMBOL)))
-    aliases = SYMBOL_PROFILES.get(profile) or [profile]
-    return aliases[0]
+    selected = str(settings.get("symbol", SYMBOL))
+    profile = normalize_symbol_text(selected)
+    aliases = SYMBOL_PROFILES.get(profile) or [selected]
+    return aliases[0] if aliases else selected
 
 
 def chat_lot(chat_id: int) -> float:
@@ -974,9 +982,10 @@ def chat_lot(chat_id: int) -> float:
 
 
 def resolve_symbol_name(value: str) -> str:
-    profile = normalize_symbol_text(value or SYMBOL)
+    selected = value or SYMBOL
+    profile = normalize_symbol_text(selected)
     aliases = SYMBOL_PROFILES.get(profile)
-    return aliases[0] if aliases else (value or SYMBOL)
+    return aliases[0] if aliases else selected
 
 
 def position_ticket(pos: dict) -> Optional[int]:
@@ -1019,9 +1028,9 @@ def is_bot_position(pos: dict) -> bool:
 
 
 def bot_symbols() -> set[str]:
-    symbols = {SYMBOL.upper()}
+    symbols = {normalize_symbol_text(SYMBOL)}
     for aliases in SYMBOL_PROFILES.values():
-        symbols.update(a.upper() for a in aliases)
+        symbols.update(normalize_symbol_text(a) for a in aliases)
     return symbols
 
 
@@ -1031,7 +1040,7 @@ async def bot_positions(symbol: Optional[str] = None) -> list[dict]:
         return []
 
     if symbol:
-        wanted = {symbol.upper()}
+        wanted = {normalize_symbol_text(symbol)}
     else:
         wanted = bot_symbols()
 
@@ -1045,7 +1054,7 @@ async def bot_positions(symbol: Optional[str] = None) -> list[dict]:
     result = []
     for pos in positions:
         ticket = position_ticket(pos)
-        pos_symbol = str(pos.get("symbol") or pos.get("Symbol") or "").upper()
+        pos_symbol = normalize_symbol_text(str(pos.get("symbol") or pos.get("Symbol") or ""))
         if is_bot_position(pos):
             result.append(pos)
         elif ticket in managed_ids:
@@ -1810,8 +1819,8 @@ async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tf = normalize_timeframe(upper)
                 settings["timeframe"] = tf
             else:
-                settings["symbol"] = upper
-                symbol = resolve_symbol_name(upper)
+                settings["symbol"] = arg
+                symbol = resolve_symbol_name(arg)
 
     signal = await analyze_symbol( symbol, tf)
     if not signal:
@@ -1833,7 +1842,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("sym:"):
-        selected = data.split(":", 1)[1].upper()
+        selected = data.split(":", 1)[1]
         settings["symbol"] = selected
         await send_menu(update, context, f"Da chon symbol *{chat_symbol(chat_id)}*.")
         return
