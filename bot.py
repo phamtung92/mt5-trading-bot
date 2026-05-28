@@ -32,6 +32,7 @@ from mcp.client.sse import sse_client
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, TimedOut
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -89,12 +90,16 @@ FOREX_CURRENCIES = (
 DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "M5").upper()
 FIXED_LOT = float(os.getenv("FIXED_LOT", "0.01"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))
-MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "0"))
 MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "80"))
 EMERGENCY_SL_ATR_MULT = float(os.getenv("EMERGENCY_SL_ATR_MULT", "1.5"))
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
+TP_RR = float(os.getenv("TP_RR", "1.2"))
+BREAKEVEN_R_MULT = float(os.getenv("BREAKEVEN_R_MULT", "0.7"))
+TRAILING_R_MULT = float(os.getenv("TRAILING_R_MULT", "1.1"))
+TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", "0.8"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
 FORCE_SIGNAL = os.getenv("FORCE_SIGNAL", "true").lower() in ("1", "true", "yes", "on")
-ENFORCE_ENTRY_WINDOW = os.getenv("ENFORCE_ENTRY_WINDOW", "false").lower() in ("1", "true", "yes", "on")
+ENFORCE_ENTRY_WINDOW = os.getenv("ENFORCE_ENTRY_WINDOW", "true").lower() in ("1", "true", "yes", "on")
 MAGIC_NUMBER = int(os.getenv("MAGIC_NUMBER", "20260523"))
 ORDER_COMMENT_PREFIX = os.getenv("ORDER_COMMENT_PREFIX", "XAU_CANDLE_AUTO")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
@@ -106,10 +111,10 @@ TELEGRAM_GET_UPDATES_TIMEOUT = int(os.getenv("TELEGRAM_GET_UPDATES_TIMEOUT", "30
 TELEGRAM_GET_UPDATES_READ_TIMEOUT = float(os.getenv("TELEGRAM_GET_UPDATES_READ_TIMEOUT", "75"))
 
 TIMEFRAMES = {
-    "M1": {"seconds": 60, "max_age": 30},
-    "M5": {"seconds": 300, "max_age": 180},
-    "M15": {"seconds": 900, "max_age": 600},
-    "H1": {"seconds": 3600, "max_age": 2400},
+    "M1": {"seconds": 60, "max_age": 20},
+    "M5": {"seconds": 300, "max_age": 90},
+    "M15": {"seconds": 900, "max_age": 240},
+    "H1": {"seconds": 3600, "max_age": 900},
 }
 
 AUTO_TASKS: dict[int, asyncio.Task] = {}
@@ -135,6 +140,67 @@ class SignalResult:
     candle_age: int
     candle_remaining: int
     candle_open_ts: int
+
+
+@dataclass
+class V3Candle:
+    open: float
+    high: float
+    low: float
+    close: float
+    body: float
+    range: float
+    upper_wick: float
+    lower_wick: float
+    close_position: float
+    direction: str
+
+
+@dataclass
+class V3Context:
+    symbol: str
+    timeframe: str
+    rates: list[dict]
+    closes: list[float]
+    last: V3Candle
+    ema20: float
+    ema50: float
+    atr: float
+    median_atr: float
+    spread_points: float
+    range_high: float
+    range_low: float
+    range_position: float
+    bullish_streak: int
+    bearish_streak: int
+    micro_bias: str
+    exhaustion: str
+    candle_age: int
+    candle_remaining: int
+    candle_open_ts: int
+    trend: str
+    common_blocks: list[str]
+
+
+@dataclass
+class V3Setup:
+    name: str
+    direction: str
+    score: int
+    valid: bool
+    reasons: list[str]
+    blocks: list[str]
+
+
+@dataclass
+class V3Decision:
+    direction: str
+    confidence: int
+    setup: str
+    reasons: list[str]
+    blocks: list[str]
+    context: V3Context
+    setups: list[V3Setup]
 
 
 class MT5MCPClient:
@@ -337,14 +403,14 @@ class MT5MCPClient:
             symbols = []
             for item in result:
                 if isinstance(item, str):
-                    symbols.append(item.strip())
+                    symbols.append(item.strip().upper())
                 elif isinstance(item, dict):
                     value = item.get("symbol") or item.get("name") or item.get("Symbol") or item.get("Name")
                     if value:
-                        symbols.append(str(value).strip())
+                        symbols.append(str(value).strip().upper())
             return [s for s in symbols if s]
         if isinstance(result, str):
-            return [line.strip() for line in result.replace(",", "\n").splitlines() if line.strip()]
+            return [line.strip().upper() for line in result.replace(",", "\n").splitlines() if line.strip()]
         return []
 
     async def get_ohlcv(self, symbol: str, timeframe: str, count: int = 120) -> list[dict]:
@@ -353,11 +419,11 @@ class MT5MCPClient:
             {"symbol_name": symbol, "timeframe": normalize_timeframe(timeframe), "count": count},
         )
         if isinstance(result, list):
-            return [r for r in result if isinstance(r, dict)]
+            return sort_rates_oldest_first([r for r in result if isinstance(r, dict)])
         if isinstance(result, dict):
             for key in ("rates", "ohlcv", "candles", "data"):
                 if isinstance(result.get(key), list):
-                    return [r for r in result[key] if isinstance(r, dict)]
+                    return sort_rates_oldest_first([r for r in result[key] if isinstance(r, dict)])
         return []
 
     async def get_all_positions(self) -> list[dict]:
@@ -374,17 +440,11 @@ class MT5MCPClient:
                     return [p for p in result[key] if isinstance(p, dict)]
         return []
 
-    async def get_deals(
-        self,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-        symbol: Optional[str] = None,
-    ) -> list[dict]:
-        args = {"from_date": from_date, "to_date": to_date, "symbol": symbol}
+    async def get_deals(self, limit: int = 10) -> list[dict]:
         result = await self._call_first([
-            ("get_deals", args),
-            ("get_order_history", args),
-            ("history_deals_get", args),
+            ("get_deals", {"limit": limit}),
+            ("get_order_history", {"limit": limit}),
+            ("history_deals_get", {"limit": limit}),
         ])
         if isinstance(result, list):
             return [d for d in result if isinstance(d, dict)]
@@ -394,7 +454,7 @@ class MT5MCPClient:
                     return [d for d in result[key] if isinstance(d, dict)]
         return []
 
-    async def place_market_order(self, symbol: str, direction: str, lot: float, sl: float, comment: str) -> dict:
+    async def place_market_order(self, symbol: str, direction: str, lot: float, sl: float, tp: float, comment: str) -> dict:
         side = direction.upper()
         result = await self._call_tool(
             "place_market_order",
@@ -404,6 +464,15 @@ class MT5MCPClient:
             return {"success": True}
         if result is False:
             return {"error": "MCP returned False"}
+        return result if isinstance(result, dict) else {"result": result}
+
+    async def modify_position(self, ticket: int, sl: Optional[float] = None, tp: Optional[float] = None) -> dict:
+        args: dict[str, Any] = {"id": ticket}
+        if sl is not None:
+            args["stop_loss"] = sl
+        if tp is not None:
+            args["take_profit"] = tp
+        result = await self._call_tool("modify_position", args)
         return result if isinstance(result, dict) else {"result": result}
 
     async def close_position(self, ticket: int) -> dict:
@@ -439,7 +508,7 @@ def first_value(data: dict, keys: tuple[str, ...], default: Any = None) -> Any:
 def load_active_trades() -> None:
     global ACTIVE_TRADES
     try:
-        with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         ACTIVE_TRADES = {int(k): v for k, v in data.items()}
     except FileNotFoundError:
@@ -637,6 +706,41 @@ def parse_float(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float
     return default
 
 
+def parse_rate_ts(row: dict) -> int:
+    value = first_value(row, ("time", "Time", "datetime", "Datetime", "date", "Date"), "")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not value:
+        return 0
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp())
+        except Exception:
+            continue
+    return 0
+
+
+def sort_rates_oldest_first(rates: list[dict]) -> list[dict]:
+    return sorted(rates, key=parse_rate_ts)
+
+
+def closed_rates_only(rates: list[dict], timeframe: str) -> list[dict]:
+    current_open = candle_open_ts(now_utc_ts(), timeframe)
+    closed = [row for row in rates if parse_rate_ts(row) and parse_rate_ts(row) < current_open]
+    return closed if len(closed) >= 60 else rates
+
+
 def extract_closes(rates: list[dict]) -> list[float]:
     return [parse_float(r, ("close", "Close", "c")) for r in rates if parse_float(r, ("close", "Close", "c")) > 0]
 
@@ -704,6 +808,54 @@ def spread_points(price: dict) -> float:
     return (ask - bid) / point if point > 0 else ask - bid
 
 
+def symbol_digits(symbol: str) -> int:
+    normalized = normalize_symbol_text(symbol)
+    if "BTC" in normalized:
+        return 2
+    if "XAU" in normalized or "GOLD" in normalized:
+        return 3
+    if normalized.endswith("JPY"):
+        return 3
+    if len(normalized) >= 6 and normalized[:3] in FOREX_CURRENCIES and normalized[3:6] in FOREX_CURRENCIES:
+        return 5
+    return 2
+
+
+def position_open_price(pos: dict) -> float:
+    return float(first_value(pos, ("open", "Open", "price_open", "PriceOpen", "price", "Price"), 0) or 0)
+
+
+def position_current_price(pos: dict, price: dict) -> float:
+    value = first_value(pos, ("price_current", "PriceCurrent", "current_price", "CurrentPrice"), 0)
+    try:
+        current = float(value or 0)
+        if current > 0:
+            return current
+    except Exception:
+        pass
+    pos_type = str(first_value(pos, ("type", "Type"), "")).upper()
+    bid = float(price.get("bid") or price.get("Bid") or 0)
+    ask = float(price.get("ask") or price.get("Ask") or 0)
+    return bid if pos_type == "BUY" else ask or bid
+
+
+def calculate_sl_tp(symbol: str, direction: str, price: dict, atr_value: float) -> tuple[float, float, float]:
+    bid = float(price.get("bid") or price.get("Bid") or 0)
+    ask = float(price.get("ask") or price.get("Ask") or 0)
+    entry = ask if direction == "BUY" else bid
+    if entry <= 0:
+        entry = bid or ask
+    distance = max(float(atr_value or 0) * SL_ATR_MULT, 0.0001)
+    digits = symbol_digits(symbol)
+    if direction == "BUY":
+        sl = round(entry - distance, digits)
+        tp = round(entry + distance * TP_RR, digits)
+    else:
+        sl = round(entry + distance, digits)
+        tp = round(entry - distance * TP_RR, digits)
+    return sl, tp, distance
+
+
 def normalize_symbol_text(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
@@ -725,11 +877,6 @@ def symbol_candidates(profile: str, aliases: list[str]) -> list[str]:
 
 
 def choose_detected_symbol(profile: str, aliases: list[str], available: list[str]) -> Optional[str]:
-    available_set = set(available)
-    for alias in [profile, *aliases]:
-        if alias in available_set:
-            return alias
-
     by_normalized = {normalize_symbol_text(symbol): symbol for symbol in available}
     candidates = symbol_candidates(profile, aliases)
     for candidate in candidates:
@@ -930,112 +1077,489 @@ def parse_position_open_ts(pos: dict) -> Optional[int]:
             return None
 
 
+def v3_value(row: dict, *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            try:
+                return float(row[key])
+            except Exception:
+                pass
+    return default
+
+
+def v3_candle(row: dict) -> V3Candle:
+    open_price = v3_value(row, "open", "Open")
+    high = v3_value(row, "high", "High")
+    low = v3_value(row, "low", "Low")
+    close = v3_value(row, "close", "Close")
+    body = abs(close - open_price)
+    candle_range = max(high - low, 0.0)
+    upper_wick = high - max(open_price, close)
+    lower_wick = min(open_price, close) - low
+    close_position = (close - low) / candle_range if candle_range > 0 else 0.5
+    direction = "BULL" if close > open_price else "BEAR" if close < open_price else "DOJI"
+    return V3Candle(open_price, high, low, close, body, candle_range, upper_wick, lower_wick, close_position, direction)
+
+
+def v3_atr_median(rates: list[dict], count: int = 40) -> float:
+    values = []
+    sample = rates[-count:] if len(rates) >= count else rates
+    for prev, cur in zip(sample, sample[1:]):
+        high = v3_value(cur, "high", "High")
+        low = v3_value(cur, "low", "Low")
+        prev_close = v3_value(prev, "close", "Close")
+        values.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    if not values:
+        return 0.0
+    values.sort()
+    return values[len(values) // 2]
+
+
+def v3_candle_streak(rates: list[dict], direction: str, max_count: int = 8) -> int:
+    count = 0
+    for row in reversed(rates[-max_count:]):
+        candle = v3_candle(row)
+        if candle.direction == direction:
+            count += 1
+        else:
+            break
+    return count
+
+
+def v3_micro_bias(rates: list[dict]) -> str:
+    candles = [v3_candle(row) for row in rates[-3:]]
+    if len(candles) < 3:
+        return "MIXED"
+    bull_count = sum(1 for candle in candles if candle.direction == "BULL")
+    bear_count = sum(1 for candle in candles if candle.direction == "BEAR")
+    closes_up = candles[-1].close > candles[-2].close > candles[-3].close
+    closes_down = candles[-1].close < candles[-2].close < candles[-3].close
+    if bull_count >= 2 and (closes_up or candles[-1].close > candles[0].open):
+        return "BULLISH"
+    if bear_count >= 2 and (closes_down or candles[-1].close < candles[0].open):
+        return "BEARISH"
+    return "MIXED"
+
+
+def v3_exhaustion(rates: list[dict], ema20: float, atr_value: float) -> str:
+    last = v3_candle(rates[-1])
+    distance = abs(last.close - ema20)
+    if v3_candle_streak(rates, "BULL") >= 3 and distance > atr_value:
+        return "BULLISH_EXHAUSTION"
+    if v3_candle_streak(rates, "BEAR") >= 3 and distance > atr_value:
+        return "BEARISH_EXHAUSTION"
+    return "NONE"
+
+
+def v3_near_ema(candle: V3Candle, ema_value: float, atr_value: float, max_distance_atr: float) -> bool:
+    if candle.low <= ema_value <= candle.high:
+        return True
+    return abs(candle.close - ema_value) <= max(atr_value * max_distance_atr, 0.01)
+
+
+def v3_build_context(symbol: str, timeframe: str, rates: list[dict], price: dict) -> Optional[V3Context]:
+    if len(rates) < 60:
+        return None
+    closes = extract_closes(rates)
+    if len(closes) < 60:
+        return None
+    last = v3_candle(rates[-1])
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    atr_value = atr(rates)
+    median_atr = v3_atr_median(rates)
+    spr = spread_points(price)
+    recent = rates[-30:]
+    range_high = max(v3_value(row, "high", "High") for row in recent)
+    range_low = min(v3_value(row, "low", "Low") for row in recent)
+    range_size = max(range_high - range_low, 0.01)
+    range_position = (last.close - range_low) / range_size
+    allowed, age, remaining = in_entry_window(timeframe)
+
+    if ema20 > ema50 and last.close > ema50:
+        trend = "BULLISH"
+    elif ema20 < ema50 and last.close < ema50:
+        trend = "BEARISH"
+    else:
+        trend = "MIXED"
+
+    common_blocks = []
+    if not math.isfinite(spr) or spr > MAX_SPREAD_POINTS:
+        common_blocks.append(f"Spread too high/unavailable: {spr:.1f}")
+    if atr_value <= 0:
+        common_blocks.append("ATR unavailable")
+    if last.range <= 0:
+        common_blocks.append("Invalid candle range")
+    if median_atr > 0 and last.range > median_atr * 2.8:
+        common_blocks.append("Last candle range is abnormally large")
+
+    return V3Context(
+        symbol=symbol,
+        timeframe=timeframe,
+        rates=rates,
+        closes=closes,
+        last=last,
+        ema20=ema20,
+        ema50=ema50,
+        atr=atr_value,
+        median_atr=median_atr,
+        spread_points=spr,
+        range_high=range_high,
+        range_low=range_low,
+        range_position=range_position,
+        bullish_streak=v3_candle_streak(rates, "BULL"),
+        bearish_streak=v3_candle_streak(rates, "BEAR"),
+        micro_bias=v3_micro_bias(rates),
+        exhaustion=v3_exhaustion(rates, ema20, atr_value),
+        candle_age=age,
+        candle_remaining=remaining,
+        candle_open_ts=candle_open_ts(now_utc_ts(), timeframe),
+        trend=trend,
+        common_blocks=common_blocks,
+    )
+
+
+def v3_timing_penalty(ctx: V3Context, score: int, reasons: list[str]) -> int:
+    if ctx.candle_age > TIMEFRAMES[ctx.timeframe]["max_age"]:
+        score -= 8
+        reasons.append(f"Entry is late in candle: {ctx.candle_age}s")
+    return score
+
+
+def v3_micro_adjustment(ctx: V3Context, direction: str, score: int, reasons: list[str]) -> int:
+    if direction == "BUY":
+        if ctx.micro_bias == "BULLISH":
+            score += 8
+            reasons.append("3-candle micro bias supports BUY")
+        elif ctx.micro_bias == "BEARISH":
+            score -= 8
+            reasons.append("3-candle micro bias against BUY")
+        if ctx.exhaustion == "BULLISH_EXHAUSTION":
+            score -= 12
+            reasons.append("Bullish exhaustion penalty")
+    elif direction == "SELL":
+        if ctx.micro_bias == "BEARISH":
+            score += 8
+            reasons.append("3-candle micro bias supports SELL")
+        elif ctx.micro_bias == "BULLISH":
+            score -= 8
+            reasons.append("3-candle micro bias against SELL")
+        if ctx.exhaustion == "BEARISH_EXHAUSTION":
+            score -= 12
+            reasons.append("Bearish exhaustion penalty")
+    return score
+
+
+def v3_force_direction_allowed(ctx: V3Context, direction: str) -> tuple[bool, str]:
+    if direction == "BUY" and ctx.range_position >= 0.88:
+        return False, "Do not force BUY near range high"
+    if direction == "SELL" and ctx.range_position <= 0.12:
+        return False, "Do not force SELL near range low"
+    if direction == "BUY" and ctx.exhaustion == "BULLISH_EXHAUSTION":
+        return False, "Do not force BUY after bullish exhaustion"
+    if direction == "SELL" and ctx.exhaustion == "BEARISH_EXHAUSTION":
+        return False, "Do not force SELL after bearish exhaustion"
+    return True, ""
+
+
+def v3_trend_pullback(ctx: V3Context) -> V3Setup:
+    reasons = []
+    blocks = []
+    score = 0
+    direction = "NO_TRADE"
+    last = ctx.last
+    weak_body = last.range > 0 and last.body < last.range * 0.18
+    pullback = any(
+        v3_near_ema(v3_candle(row), ctx.ema20, ctx.atr, 0.8) or v3_near_ema(v3_candle(row), ctx.ema50, ctx.atr, 0.8)
+        for row in ctx.rates[-3:]
+    )
+
+    if ctx.trend == "BULLISH":
+        direction = "BUY"
+        score += 25
+        reasons.append("Setup Trend Pullback: EMA trend bullish")
+        if pullback:
+            score += 25
+            reasons.append("Recent pullback near EMA20/EMA50")
+        else:
+            blocks.append("No recent EMA pullback")
+        if last.direction == "BULL" or last.lower_wick >= last.body * 0.8:
+            score += 25
+            reasons.append("Bullish candle/rejection confirmation")
+        else:
+            blocks.append("No bullish candle confirmation")
+        if abs(last.close - ctx.ema20) <= ctx.atr * 0.9:
+            score += 10
+            reasons.append("Not chasing far from EMA20")
+        else:
+            blocks.append("Price too far from EMA20 for pullback")
+    elif ctx.trend == "BEARISH":
+        direction = "SELL"
+        score += 25
+        reasons.append("Setup Trend Pullback: EMA trend bearish")
+        if pullback:
+            score += 25
+            reasons.append("Recent pullback near EMA20/EMA50")
+        else:
+            blocks.append("No recent EMA pullback")
+        if last.direction == "BEAR" or last.upper_wick >= last.body * 0.8:
+            score += 25
+            reasons.append("Bearish candle/rejection confirmation")
+        else:
+            blocks.append("No bearish candle confirmation")
+        if abs(last.close - ctx.ema20) <= ctx.atr * 0.9:
+            score += 10
+            reasons.append("Not chasing far from EMA20")
+        else:
+            blocks.append("Price too far from EMA20 for pullback")
+    else:
+        blocks.append("EMA trend is mixed")
+
+    if weak_body and direction != "NO_TRADE":
+        score -= 10
+        reasons.append("Weak/doji candle penalty")
+    score = v3_micro_adjustment(ctx, direction, score, reasons)
+    score = v3_timing_penalty(ctx, score, reasons)
+    return V3Setup("Trend Pullback", direction, score, score >= 55 and not blocks, reasons, blocks)
+
+
+def v3_range_reversal(ctx: V3Context) -> V3Setup:
+    reasons = []
+    blocks = []
+    score = 0
+    direction = "NO_TRADE"
+    last = ctx.last
+    weak_body = last.range > 0 and last.body < last.range * 0.18
+    ema_gap = abs(ctx.ema20 - ctx.ema50)
+    range_size = max(ctx.range_high - ctx.range_low, 0.01)
+    range_like = ctx.trend == "MIXED" or ema_gap <= max(ctx.atr * 0.8, range_size * 0.18)
+
+    if range_like:
+        score += 20
+        reasons.append("Setup Range Reversal: market is range-like")
+    else:
+        blocks.append("Market is not range-like")
+
+    if ctx.range_position <= 0.25:
+        direction = "BUY"
+        score += 25
+        reasons.append("Price near 30-candle range low")
+        if last.lower_wick >= last.body * 0.8 or (last.direction == "BULL" and last.close_position >= 0.55):
+            score += 30
+            reasons.append("Lower rejection from range low")
+        else:
+            blocks.append("No lower rejection")
+        if last.close >= ctx.range_low:
+            score += 10
+            reasons.append("Close stayed inside/above range low")
+        else:
+            blocks.append("Closed below range low")
+    elif ctx.range_position >= 0.75:
+        direction = "SELL"
+        score += 25
+        reasons.append("Price near 30-candle range high")
+        if last.upper_wick >= last.body * 0.8 or (last.direction == "BEAR" and last.close_position <= 0.45):
+            score += 30
+            reasons.append("Upper rejection from range high")
+        else:
+            blocks.append("No upper rejection")
+        if last.close <= ctx.range_high:
+            score += 10
+            reasons.append("Close stayed inside/below range high")
+        else:
+            blocks.append("Closed above range high")
+    else:
+        blocks.append("Price is not near range edge")
+
+    if weak_body and direction != "NO_TRADE":
+        if last.upper_wick >= last.range * 0.35 or last.lower_wick >= last.range * 0.35:
+            score += 5
+            reasons.append("Doji accepted because wick rejection is visible")
+        else:
+            score -= 10
+            reasons.append("Weak/doji candle penalty")
+    score = v3_micro_adjustment(ctx, direction, score, reasons)
+    score = v3_timing_penalty(ctx, score, reasons)
+    return V3Setup("Range Reversal", direction, score, score >= 55 and not blocks, reasons, blocks)
+
+
+def v3_momentum_continuation(ctx: V3Context) -> V3Setup:
+    reasons = []
+    blocks = []
+    score = 0
+    direction = "NO_TRADE"
+    last = ctx.last
+    lookback = ctx.rates[-11:-1]
+    prior_high = max(v3_value(row, "high", "High") for row in lookback)
+    prior_low = min(v3_value(row, "low", "Low") for row in lookback)
+    body_ok = last.range > 0 and last.body >= last.range * 0.4
+    weak_body = last.range > 0 and last.body < last.range * 0.18
+
+    if last.close > prior_high:
+        direction = "BUY"
+        score += 30
+        reasons.append("Setup Momentum Continuation: breakout above prior 10-candle high")
+        if weak_body:
+            blocks.append("Doji candle cannot confirm momentum breakout")
+        if last.close_position >= 0.72 and body_ok:
+            score += 25
+            reasons.append("Strong bullish breakout candle")
+        else:
+            blocks.append("Breakout candle not strong enough")
+        if ctx.ema20 >= ctx.ema50 or last.close > ctx.ema20:
+            score += 15
+            reasons.append("Momentum aligns with EMA context")
+        else:
+            blocks.append("Momentum conflicts with EMA context")
+        if ctx.bullish_streak <= 3:
+            score += 10
+            reasons.append("Not overextended by bullish streak")
+        else:
+            blocks.append("Too many bullish candles in a row")
+        if abs(last.close - ctx.ema20) <= ctx.atr * 1.25:
+            score += 10
+            reasons.append("Breakout not too far from EMA20")
+        else:
+            blocks.append("Breakout is too far from EMA20")
+    elif last.close < prior_low:
+        direction = "SELL"
+        score += 30
+        reasons.append("Setup Momentum Continuation: breakdown below prior 10-candle low")
+        if weak_body:
+            blocks.append("Doji candle cannot confirm momentum breakdown")
+        if last.close_position <= 0.28 and body_ok:
+            score += 25
+            reasons.append("Strong bearish breakdown candle")
+        else:
+            blocks.append("Breakdown candle not strong enough")
+        if ctx.ema20 <= ctx.ema50 or last.close < ctx.ema20:
+            score += 15
+            reasons.append("Momentum aligns with EMA context")
+        else:
+            blocks.append("Momentum conflicts with EMA context")
+        if ctx.bearish_streak <= 3:
+            score += 10
+            reasons.append("Not overextended by bearish streak")
+        else:
+            blocks.append("Too many bearish candles in a row")
+        if abs(last.close - ctx.ema20) <= ctx.atr * 1.25:
+            score += 10
+            reasons.append("Breakdown not too far from EMA20")
+        else:
+            blocks.append("Breakdown is too far from EMA20")
+    else:
+        blocks.append("No 10-candle breakout/breakdown")
+
+    score = v3_micro_adjustment(ctx, direction, score, reasons)
+    score = v3_timing_penalty(ctx, score, reasons)
+    return V3Setup("Momentum Continuation", direction, score, score >= 55 and not blocks, reasons, blocks)
+
+
+def v3_choose_setup(ctx: V3Context, setups: list[V3Setup]) -> V3Decision:
+    valid = [setup for setup in setups if setup.valid and setup.direction != "NO_TRADE"]
+    if ctx.common_blocks:
+        return V3Decision("NO_TRADE", max((setup.score for setup in setups), default=0), "Blocked", [], ctx.common_blocks, ctx, setups)
+    if valid:
+        def setup_rank(setup: V3Setup) -> tuple[int, int]:
+            edge_bonus = 8 if setup.name == "Range Reversal" and (ctx.range_position <= 0.28 or ctx.range_position >= 0.72) else 0
+            if setup.name == "Momentum Continuation" and 0.28 < ctx.range_position < 0.72:
+                edge_bonus = 4
+            return (setup.score + edge_bonus, 1 if setup.name == "Range Reversal" else 0)
+
+        selected = max(valid, key=setup_rank)
+        return V3Decision(selected.direction, min(95, selected.score), selected.name, selected.reasons, selected.blocks, ctx, setups)
+
+    best = max(setups, key=lambda item: item.score)
+    if FORCE_SIGNAL and best.direction != "NO_TRADE" and best.score >= 35:
+        allowed, block = v3_force_direction_allowed(ctx, best.direction)
+        weak_trend_pullback = best.name == "Trend Pullback" and any(
+            key in block_text
+            for block_text in best.blocks
+            for key in ("No recent EMA pullback", "Price too far from EMA20")
+        )
+        if not allowed or weak_trend_pullback:
+            best.blocks.append(block or "Trend Pullback force blocked because entry would chase price")
+            return V3Decision("NO_TRADE", min(best.score, 45), "No valid setup", best.reasons, best.blocks, ctx, setups)
+        reasons = [*best.reasons, "FORCE_SIGNAL fallback from best partial setup"]
+        confidence_cap = 54
+        if best.name == "Range Reversal" and any("rejection" in block.lower() for block in best.blocks):
+            confidence_cap = 52
+            reasons.append("Range force capped because rejection is missing")
+        return V3Decision(best.direction, max(51, min(confidence_cap, best.score)), f"{best.name} (force)", reasons, best.blocks, ctx, setups)
+    if FORCE_SIGNAL and ctx.micro_bias in ("BULLISH", "BEARISH"):
+        direction = "BUY" if ctx.micro_bias == "BULLISH" else "SELL"
+        allowed, block = v3_force_direction_allowed(ctx, direction)
+        if not allowed:
+            return V3Decision("NO_TRADE", 45, "No valid setup", [], [block], ctx, setups)
+        reasons = [
+            f"FORCE_SIGNAL fallback from 3-candle micro bias: {ctx.micro_bias}",
+            "No full setup is valid, using weakest directional fallback",
+        ]
+        if ctx.exhaustion != "NONE":
+            reasons.append(f"Exhaustion warning: {ctx.exhaustion}")
+        return V3Decision(direction, 51, "Micro Bias (force)", reasons, best.blocks, ctx, setups)
+    return V3Decision("NO_TRADE", best.score, "No valid setup", best.reasons, best.blocks, ctx, setups)
+
+
 async def analyze_symbol(symbol: str, timeframe: str) -> Optional[SignalResult]:
     logger.info(f"[ANALYZE] analyze_symbol started: {symbol} {timeframe}")
     timeframe = normalize_timeframe(timeframe)
-    allowed, age, remaining = in_entry_window(timeframe)
-    entry_warning = ""
-    if not allowed:
-        entry_warning = f"Nen {timeframe} da chay {age}s, vuot moc dau nen {TIMEFRAMES[timeframe]['max_age']}s"
-
     logger.info(f"[ANALYZE] calling mt5.get_ohlcv({symbol}, {timeframe}, 150)")
     rates = await mt5.get_ohlcv(symbol, timeframe, 150)
     logger.info(f"[ANALYZE] get_ohlcv returned {len(rates)} rates")
-    closes = extract_closes(rates)
     logger.info(f"[ANALYZE] calling mt5.get_symbol_price({symbol})")
     price = await mt5.get_symbol_price(symbol)
     spr = spread_points(price)
+    allowed, age, remaining = in_entry_window(timeframe)
+    analysis_rates = closed_rates_only(rates, timeframe)
 
-    if len(closes) < 3:
+    ctx = v3_build_context(symbol, timeframe, analysis_rates, price)
+    if ctx is None:
         if FORCE_SIGNAL:
             direction = "BUY" if (now_utc_ts() // TIMEFRAMES[timeframe]["seconds"]) % 2 == 0 else "SELL"
             reasons = [
                 "Force signal: MCP khong tra du lieu nen, van tao tin hieu de test",
                 "Can kiem tra symbol broker/Market Watch neu muon tin hieu theo data that",
             ]
-            if entry_warning:
-                reasons.append(entry_warning)
             return SignalResult(direction, 51, reasons, "No candle data", "Fallback", "Unknown", 50, 0, spr, age, remaining, candle_open_ts(now_utc_ts(), timeframe))
         return SignalResult("NO_TRADE", 0, ["Khong du du lieu nen de phan tich"], "N/A", "N/A", "N/A", 50, 0, spr, age, remaining, candle_open_ts(now_utc_ts(), timeframe))
-    spread_warning = spr > MAX_SPREAD_POINTS
 
-    fast = ema(closes, 9)
-    slow = ema(closes, 21)
-    long = ema(closes, 50)
-    rsi_value = rsi(closes)
-    hist = macd_hist(closes)
-    atr_value = atr(rates)
+    setups = [
+        v3_trend_pullback(ctx),
+        v3_range_reversal(ctx),
+        v3_momentum_continuation(ctx),
+    ]
+    decision = v3_choose_setup(ctx, setups)
+    rsi_value = rsi(ctx.closes)
 
-    buy_score = 0
-    sell_score = 0
-    reasons = []
+    reasons = [f"Analyzer v3: {decision.setup}", *decision.reasons]
+    if decision.blocks:
+        reasons.extend(f"Block: {block}" for block in decision.blocks[:3])
+    if ctx.common_blocks:
+        reasons.extend(f"Hard block: {block}" for block in ctx.common_blocks[:3])
+    reasons.extend([
+        f"Context: trend={ctx.trend}, micro={ctx.micro_bias}, range_pos={ctx.range_position:.2f}",
+        f"Streak: bull={ctx.bullish_streak}, bear={ctx.bearish_streak}, exhaustion={ctx.exhaustion}",
+    ])
+    if not allowed:
+        reasons.append(f"Nen {timeframe} da chay {age}s, vuot moc dau nen {TIMEFRAMES[timeframe]['max_age']}s")
+        decision.direction = "NO_TRADE"
+        decision.confidence = min(decision.confidence, 40)
 
-    if fast > slow > long:
-        buy_score += 30
-        reasons.append("EMA trend bullish")
-    elif fast < slow < long:
-        sell_score += 30
-        reasons.append("EMA trend bearish")
-
-    if hist > 0:
-        buy_score += 25
-        reasons.append("MACD momentum bullish")
-    elif hist < 0:
-        sell_score += 25
-        reasons.append("MACD momentum bearish")
-
-    if 50 <= rsi_value <= 70:
-        buy_score += 20
-        reasons.append(f"RSI buy zone {rsi_value:.1f}")
-    elif 30 <= rsi_value <= 50:
-        sell_score += 20
-        reasons.append(f"RSI sell zone {rsi_value:.1f}")
-    elif rsi_value > 75:
-        sell_score += 10
-        reasons.append(f"RSI overbought {rsi_value:.1f}")
-    elif rsi_value < 25:
-        buy_score += 10
-        reasons.append(f"RSI oversold {rsi_value:.1f}")
-
-    if closes[-1] > fast:
-        buy_score += 15
-        reasons.append("Price above fast EMA")
-    elif closes[-1] < fast:
-        sell_score += 15
-        reasons.append("Price below fast EMA")
-
-    if atr_value > 0:
-        buy_score += 10
-        sell_score += 10
-
-    if buy_score > sell_score and (buy_score >= MIN_CONFIDENCE or FORCE_SIGNAL):
-        direction = "BUY"
-        confidence = min(95, max(buy_score, 51))
-    elif sell_score > buy_score and (sell_score >= MIN_CONFIDENCE or FORCE_SIGNAL):
-        direction = "SELL"
-        confidence = min(95, max(sell_score, 51))
-    elif FORCE_SIGNAL:
-        last_close = closes[-1]
-        prev_close = closes[-2]
-        direction = "BUY" if last_close >= prev_close else "SELL"
-        confidence = max(51, min(60, max(buy_score, sell_score)))
-        reasons.append("Force signal: chon huong theo nen gan nhat vi score chua du manh")
+    if decision.direction in ("BUY", "SELL"):
+        direction = decision.direction
+        confidence = decision.confidence
     else:
         direction = "NO_TRADE"
-        confidence = max(buy_score, sell_score)
-        reasons.append("Tin hieu chua du manh")
+        confidence = decision.confidence
+        reasons.append("No valid v3 setup")
 
-    if spread_warning:
-        reasons.append(f"Canh bao spread cao: {spr:.1f} points")
-    if entry_warning:
-        reasons.append(entry_warning)
-
-    trend = "Bullish" if fast > slow > long else "Bearish" if fast < slow < long else "Mixed"
-    momentum = "Bullish" if hist > 0 else "Bearish" if hist < 0 else "Flat"
-    volatility = "Normal" if atr_value > 0 else "Unknown"
+    trend = "Bullish" if ctx.trend == "BULLISH" else "Bearish" if ctx.trend == "BEARISH" else "Mixed"
+    momentum = "Bullish" if ctx.micro_bias == "BULLISH" else "Bearish" if ctx.micro_bias == "BEARISH" else "Mixed"
+    volatility = "High" if ctx.median_atr > 0 and ctx.atr > ctx.median_atr * 1.6 else "Normal" if ctx.atr > 0 else "Unknown"
 
     logger.info(f"[ANALYZE] analyze_symbol done: {direction} {confidence}%")
-    return SignalResult(direction, confidence, reasons, trend, momentum, volatility, rsi_value, atr_value, spr, age, remaining, candle_open_ts(now_utc_ts(), timeframe))
+    return SignalResult(direction, confidence, reasons, trend, momentum, volatility, rsi_value, ctx.atr, spr, age, remaining, ctx.candle_open_ts)
 
 
 async def emergency_sl(symbol: str, direction: str, atr_value: float) -> float:
@@ -1050,14 +1574,14 @@ async def emergency_sl(symbol: str, direction: str, atr_value: float) -> float:
 
 
 def format_signal(symbol: str, timeframe: str, signal: SignalResult) -> str:
-    reasons = "\n".join(f"- {r}" for r in signal.reasons[:8])
+    reasons = "\n".join(f"- {escape_markdown(str(r), version=1)}" for r in signal.reasons[:8])
     return "\n".join([
         f"*{symbol} {timeframe} Analysis*",
         "",
         f"Signal: *{signal.direction}*",
         f"Confidence: *{signal.confidence}%*",
         f"Entry window: {signal.candle_age}s / max {TIMEFRAMES[timeframe]['max_age']}s",
-        f"Exit: candle close in {signal.candle_remaining}s",
+        f"Trade management: SL/TP, no candle-close exit",
         f"Spread: {signal.spread_points:.1f} points",
         "",
         "*Market Info:*",
@@ -1198,11 +1722,11 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: Op
         f"Symbol: `{symbol}`",
         f"Timeframe: *{tf}*",
         f"Mode: *Auto Trade*",
-        f"Lot: `{lot}` + emergency SL",
+        f"Lot: `{lot}` | SL: `{SL_ATR_MULT} ATR` | TP: `{TP_RR}R`",
         f"Auto: *{status}*",
         "",
         "Entry age limit:",
-        "M1 <= 30s | M5 <= 3m | M15 <= 10m | H1 <= 40m",
+        "M1 <= 20s | M5 <= 90s | M15 <= 4m | H1 <= 15m",
     ])
     if update.callback_query:
         await telegram_call_with_retry(update.callback_query.edit_message_text, body, parse_mode="Markdown", reply_markup=main_keyboard())
@@ -1337,7 +1861,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             signal.confidence = max(signal.confidence, 51)
         else:
             signal = SignalResult(direction, 51, ["Manual place from Telegram"], "Manual", "Manual", "Unknown", 50, 0, math.inf, candle_age(now_utc_ts(), tf), candle_remaining(now_utc_ts(), tf), candle_open_ts(now_utc_ts(), tf))
-        result = await open_auto_trade( chat_id, symbol, tf, signal)
+        result = await open_auto_trade(chat_id, symbol, tf, signal, manual=True)
         if chat_id in ACTIVE_TRADES:
             ensure_trade_monitor(chat_id, context)
         edited = await query.edit_message_text(result, parse_mode="Markdown", reply_markup=main_keyboard())
@@ -1428,12 +1952,16 @@ async def auto_trade_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
             current_open = candle_open_ts(now_utc_ts(), timeframe)
             allowed, age, remaining = in_entry_window(timeframe)
-            if ENFORCE_ENTRY_WINDOW and not allowed:
+            if not allowed:
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
             signal = await analyze_symbol( symbol, timeframe)
             if not signal or signal.direction == "NO_TRADE":
+                await context.bot.send_message(chat_id, format_signal(symbol, timeframe, signal), parse_mode="Markdown")
+                await asyncio.sleep(POLL_SECONDS)
+                continue
+            if signal.confidence < MIN_CONFIDENCE:
                 await context.bot.send_message(chat_id, format_signal(symbol, timeframe, signal), parse_mode="Markdown")
                 await asyncio.sleep(POLL_SECONDS)
                 continue
@@ -1450,56 +1978,20 @@ async def auto_trade_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def daily_loss_guard(symbol: str) -> tuple[bool, str]:
-    if MAX_DAILY_LOSS_PERCENT <= 0:
-        return True, ""
-
-    account = await mt5.get_account_info()
-    balance = parse_float(
-        account,
-        ("balance", "Balance", "equity", "Equity"),
-        0.0,
-    )
-    if balance <= 0:
-        logger.warning("Daily loss guard skipped: invalid account balance in %s", account)
-        return True, ""
-
-    today = datetime.now(timezone.utc).date().isoformat()
-    deals = await mt5.get_deals(from_date=today, to_date=today, symbol=symbol)
-    if not deals:
-        return True, ""
-
-    realized_profit = sum(
-        parse_float(deal, ("profit", "Profit", "pnl", "PnL", "profit_loss", "ProfitLoss"), 0.0)
-        for deal in deals
-    )
-    if realized_profit >= 0:
-        return True, ""
-
-    loss_pct = abs(realized_profit) / balance * 100
-    if loss_pct < MAX_DAILY_LOSS_PERCENT:
-        return True, ""
-
-    return False, (
-        f"Daily loss limit reached: {money(realized_profit)} "
-        f"({loss_pct:.2f}% / {MAX_DAILY_LOSS_PERCENT:.2f}%)."
-    )
-
-
-async def open_auto_trade(chat_id: int, symbol: str, timeframe: str, signal: SignalResult) -> str:
+async def open_auto_trade(chat_id: int, symbol: str, timeframe: str, signal: SignalResult, manual: bool = False) -> str:
     allowed, age, remaining = in_entry_window(timeframe)
-    if ENFORCE_ENTRY_WINDOW and not allowed:
+    if not manual and not allowed:
         return f"Entry rejected: nen {timeframe} da chay {age}s."
-    daily_ok, daily_message = await daily_loss_guard(symbol)
-    if not daily_ok:
-        return daily_message
+    if not manual and signal.confidence < MIN_CONFIDENCE:
+        return f"Entry rejected: confidence {signal.confidence}% < {MIN_CONFIDENCE}%."
     existing_positions = await bot_positions(symbol)
     before_tickets = {position_ticket(pos) for pos in existing_positions if position_ticket(pos)}
 
     lot = chat_lot(chat_id)
-    sl = await emergency_sl(symbol, signal.direction, signal.atr)
+    price = await mt5.get_symbol_price(symbol)
+    sl, tp, risk_distance = calculate_sl_tp(symbol, signal.direction, price, signal.atr)
     comment = f"{ORDER_COMMENT_PREFIX}_{timeframe}_{signal.direction}"
-    result = await mt5.place_market_order(symbol, signal.direction, lot, sl, comment)
+    result = await mt5.place_market_order(symbol, signal.direction, lot, sl, tp, comment)
     if mt5._is_error(result):
         return f"Khong dat duoc lenh: `{mt5._error_message(result)}`"
 
@@ -1517,6 +2009,11 @@ async def open_auto_trade(chat_id: int, symbol: str, timeframe: str, signal: Sig
             if new_tickets:
                 ticket = new_tickets[-1]
                 break
+    modify_error = ""
+    if ticket is not None:
+        modify_result = await mt5.modify_position(int(ticket), sl, tp)
+        if mt5._is_error(modify_result):
+            modify_error = f"\nSL/TP modify error: `{mt5._error_message(modify_result)}`"
     ticket = ticket or "N/A"
     add_active_trade(chat_id, {
         "ticket": ticket,
@@ -1525,6 +2022,13 @@ async def open_auto_trade(chat_id: int, symbol: str, timeframe: str, signal: Sig
         "direction": signal.direction,
         "candle_open_ts": signal.candle_open_ts,
         "opened_at": now_utc_ts(),
+        "sl": sl,
+        "tp": tp,
+        "risk_distance": risk_distance,
+        "atr": signal.atr,
+        "breakeven_done": False,
+        "setup": signal.reasons[0] if signal.reasons else "",
+        "confidence": signal.confidence,
     })
     save_active_trades()
     return "\n".join([
@@ -1534,88 +2038,83 @@ async def open_auto_trade(chat_id: int, symbol: str, timeframe: str, signal: Sig
         f"Direction: *{signal.direction}*",
         f"Timeframe: *{timeframe}*",
         f"Lot: `{lot}`",
-        f"Emergency SL: `{sl}`",
-        f"Close in: `{remaining}s`",
+        f"SL: `{sl}`",
+        f"TP: `{tp}`",
+        f"Management: `SL/TP + breakeven/trailing`",
         f"Ticket: `{ticket}`",
+        modify_error,
     ])
 
 
 async def manage_active_trade(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     trades = active_trade_items(chat_id)
-    settings = CHAT_SETTINGS.setdefault(chat_id, {"timeframe": DEFAULT_TIMEFRAME, "symbol": SYMBOL})
-    timeframe = normalize_timeframe((trades[-1] if trades else {}).get("timeframe") or settings.get("timeframe"))
-    symbol = (trades[-1] if trades else {}).get("symbol") or chat_symbol(chat_id)
-
-    current_candle_open = candle_open_ts(now_utc_ts(), timeframe)
-    positions = await bot_positions(symbol)
-
-    logger.info("=== MANAGE_ACTIVE_TRADE DEBUG ===")
-    logger.info(f"Chat ID: {chat_id}")
-    logger.info(f"Timeframe: {timeframe}")
-    logger.info(f"Symbol: {symbol}")
-    logger.info(f"Now UTC: {now_utc_ts()}")
-    logger.info(f"Current candle_open_ts: {current_candle_open}")
-    logger.info(f"Active trades: {trades}")
-    logger.info(f"Bot positions count: {len(positions)}")
-
-    closed_trade_message_id = None
-    remaining_trades = []
-    if trades:
-        tickets = []
-        for trade in trades:
-            trade_timeframe = normalize_timeframe(trade.get("timeframe") or timeframe)
-            trade_current_candle = candle_open_ts(now_utc_ts(), trade_timeframe)
-            trade_candle_open = int(trade["candle_open_ts"])
-            logger.info(f"Trade candle_open_ts: {trade_candle_open}")
-            logger.info(f"Should close? {trade_current_candle > trade_candle_open}")
-            if trade_current_candle <= trade_candle_open:
-                remaining_trades.append(trade)
-                continue
-            ticket = trade.get("ticket")
-            if ticket != "N/A" and str(ticket).isdigit():
-                tickets.append(int(ticket))
-                closed_trade_message_id = closed_trade_message_id or trade.get("message_id")
-            else:
-                tickets.extend(position_ticket(p) for p in positions if position_ticket(p))
-                closed_trade_message_id = closed_trade_message_id or trade.get("message_id")
-    else:
-        tickets = []
-        for pos in positions:
-            opened_at = parse_position_open_ts(pos)
-            if opened_at is None:
-                continue
-            if current_candle_open > candle_open_ts(opened_at, timeframe):
-                ticket = position_ticket(pos)
-                if ticket:
-                    tickets.append(ticket)
-
-    if not tickets:
-        set_active_trade_items(chat_id, remaining_trades)
-        save_active_trades()
+    if not trades:
         return
 
-    tickets = list(dict.fromkeys(ticket for ticket in tickets if ticket))
+    positions = await bot_positions()
     position_by_ticket = {position_ticket(pos): pos for pos in positions if position_ticket(pos)}
-    closed_lines = []
-    error_lines = []
-    for item in tickets:
-        result = await mt5.close_position(item)
-        if mt5._is_error(result):
-            error_lines.append(f"- Ticket `{item}`: `{mt5._error_message(result)}`")
-        else:
-            closed_lines.append(close_result_line(item, result, position_by_ticket.get(item)))
+    remaining_trades = []
+    finished_lines = []
 
-    result_message = [
-        "*Trade Closed - Candle Close*",
-        "",
-    ]
-    if closed_lines:
-        result_message.extend(closed_lines)
-    if error_lines:
-        result_message.extend(["", "*Close Errors:*", *error_lines])
-    result_message.extend(["", "*Menu:*"])
+    for trade in trades:
+        ticket = trade.get("ticket")
+        if ticket == "N/A" or not str(ticket).isdigit():
+            remaining_trades.append(trade)
+            continue
 
-    await edit_trade_result_message(context, chat_id, "\n".join(result_message), closed_trade_message_id)
+        ticket_int = int(ticket)
+        pos = position_by_ticket.get(ticket_int)
+        if not pos:
+            finished_lines.append(f"- Ticket `{ticket_int}` finished by SL/TP/manual close")
+            continue
+
+        symbol = str(trade.get("symbol") or first_value(pos, ("symbol", "Symbol"), SYMBOL))
+        direction = str(trade.get("direction") or first_value(pos, ("type", "Type"), "")).upper()
+        entry = position_open_price(pos)
+        risk_distance = float(trade.get("risk_distance") or 0)
+        sl = float(trade.get("sl") or first_value(pos, ("stop_loss", "StopLoss", "sl", "SL"), 0) or 0)
+        tp = float(trade.get("tp") or first_value(pos, ("take_profit", "TakeProfit", "tp", "TP"), 0) or 0)
+
+        if entry > 0 and risk_distance > 0 and direction in ("BUY", "SELL"):
+            price = await mt5.get_symbol_price(symbol)
+            current = position_current_price(pos, price)
+            move = current - entry if direction == "BUY" else entry - current
+            new_sl = None
+
+            if not trade.get("breakeven_done") and move >= risk_distance * BREAKEVEN_R_MULT:
+                new_sl = round(entry, symbol_digits(symbol))
+                trade["breakeven_done"] = True
+            elif move >= risk_distance * TRAILING_R_MULT:
+                atr_value = trade.get("atr")
+                if not atr_value:
+                    rates = closed_rates_only(await mt5.get_ohlcv(symbol, normalize_timeframe(trade.get("timeframe") or DEFAULT_TIMEFRAME), 80), normalize_timeframe(trade.get("timeframe") or DEFAULT_TIMEFRAME))
+                    atr_value = atr(rates)
+                trail_distance = max(float(atr_value or 0) * TRAILING_ATR_MULT, risk_distance * 0.5)
+                if direction == "BUY":
+                    candidate = round(current - trail_distance, symbol_digits(symbol))
+                    if candidate > sl:
+                        new_sl = candidate
+                else:
+                    candidate = round(current + trail_distance, symbol_digits(symbol))
+                    if sl <= 0 or candidate < sl:
+                        new_sl = candidate
+
+            if new_sl is not None:
+                modify_result = await mt5.modify_position(ticket_int, new_sl, tp if tp > 0 else None)
+                if mt5._is_error(modify_result):
+                    logger.warning("Cannot update SL for %s: %s", ticket_int, mt5._error_message(modify_result))
+                else:
+                    trade["sl"] = new_sl
+
+        remaining_trades.append(trade)
+
+    if finished_lines:
+        await context.bot.send_message(
+            chat_id,
+            "\n".join(["*Trade Finished*", "", *finished_lines, "", "*Menu:*"]),
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(),
+        )
     set_active_trade_items(chat_id, remaining_trades)
     save_active_trades()
 
